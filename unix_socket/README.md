@@ -1,22 +1,22 @@
 ## 背景/動機
 
 現在nginxとphp-fpmを利用していてsocket接続時にResource temporary unavailableというエラーが出力される。
-unix domain socketを利用しているがこれがどのような通信なのか基礎的なことも分かっていない。
-そのためエラーが発生していたとしても根本原因がどこにあるのかが理解できない状況にある。
+エラーを解決しなければならないが、根本的な問題としてunix domain socketのことを理解していない。
+unix domain socketを理解するために、いろいろな観点から調査をしたいと考えた。
 
-なおこのエラーは受信バッファのサイズを大きくする、バックログ数を大きくする、といった対処をとる記事がよく見られる。
-これは確かに緩やかなリソースの上昇により発生している場合にはパフォーマンスチューニングとして適切な値に思う。
+インターネットで検索すると、エラーは受信バッファのサイズを大きくする、バックログ数を大きくする、といった対処がよく見られる。
+これは緩やかなリソースの上昇により発生している場合にはパフォーマンスチューニングとして適切な値に思う。
 しかし今回のエラーは平常時はリソースに余裕がある状態から、稀にエラーが発生するという状況である。
 数百プロセスはほとんどidle状態で、何かしらに遅延が発生して一気にidle状態のプロセスがなくなる。
 idle状態のプロセスがなくなったタイミングで空きプロセスが無いためunix domain socketに接続できずにエラーが発生しているという状況だ。
-unix socket - php - tcp socket - DB この一連のどこかで障害が発生しているのは間違いなさそうなのだがそれがどこなのか分からない。
+unix socket - php - tcp socket - DB この一連のどこかに問題があるのは間違いなさそうだがそれがどこなのか分からない。
 
 ## 目的
 
-unix domain socket通信時にエラーが発生する場合を調べる。
-問題としてはnginxがphp-fpmのunix domain socketとconnectするときにエラーを出していることだ。
+unix domain socket接続時にエラーが発生する直接原因を調べる。(※根本原因ではない)
+ログの出力ではnginxがphp-fpmのunix domain socketとconnectするときにエラーが発生していることが分かっている。
 そのため、まずはOSとしてどのように通信を行っているかを調べ、nginxの通信方法を調査する。
-通信の理解のためにphp-fpmの通信の流れも確認してみる。
+通信の理解のためにphp-fpmの通信の流れも確認する。
 
 ## 疑問
 
@@ -30,7 +30,7 @@ unix domain socket通信時にエラーが発生する場合を調べる。
 [UnixDomainSocketのマニュアル](https://linuxjm.osdn.jp/html/LDP_man-pages/man7/unix.7.html)
 
 Unix Domain Socket自体は単なるプロセス間通信のための手段。
-OSが提供している通信の手段は主に以下の通り。
+Linuxが提供している通信の手段は主に以下の通り。
 
 ```
 プロセス間通信
@@ -99,7 +99,7 @@ https://github.com/php/php-src/blob/5d6e923d46a89fe9cd8fb6c3a6da675aa67197b4/mai
 
 fpm_main.c(main) -> fastcgi.c(fcgi_accept_request)
 
-acceptブロックし、受けたらリクエストを処理。
+acceptでブロックし、受けたらリクエストを処理。
 
 * read()
 
@@ -181,7 +181,7 @@ tcpであればtcpdumpやwiresharkなど様々なツールが存在する。
 
 * strace
 
-システムコールを介するのでsystemcallの呼び出し状況が見られるstraceを使う方法が紹介されていた。
+システムコールを介するので呼び出し状況が確認できるstraceを使う方法が紹介されていたので試してみる。
 
 `strace ./server` の実行結果が以下の通り。
 
@@ -289,7 +289,7 @@ client.sock => socat => server.sock
 
 ## 通信時にエラーが発生する場合はどのような場合か
 
-ここまでで、エラーが発生する場所として人間が網羅するには多すぎることはわかるだろうか。
+ここまでで、エラーが発生する場所として人間が網羅するには多すぎることはわかった。
 
 アプリケーションから見た通信に必要な関数はだいたい決まっている。
 
@@ -311,13 +311,11 @@ writeとreadと書いたが、nginxは実際にはsend/recvを利用している
 
 一方でserver側に必要なものは、listen/accept/read/write。
 
-php-fpmを見る限りはこれに加えてpollも含まれるだろうか。
+php-fpmでは初めに示した通りの流れである。加えるならばpollを追加するくらいだろう。
 
-そして最終的にLISTEN以外のコネクションは閉じる必要があるためcloseが必要となる。
+そして最終的にLISTEN以外のコネクションは閉じる必要があるため共通な関数としてcloseが必要となる。
 
-ざっと文字にしただけでも関連する関数が多いことが分かるだろう。
-
-M/Wを作成する際は確認が必須だが、今の目的はエラーの調査だ。
+ここまで出てきた関数は8つ。１つの関数が5種類のエラーを返すとしたら、40通りのエラーのバリエーションがあり、エラー調査のために網羅することに意味はあまりない。
 
 そのため、今回エラーが発生していた個所だけ見てみることとする。
 
@@ -332,8 +330,6 @@ M/Wを作成する際は確認が必須だが、今の目的はエラーの調�
 これが発生するまでの経路は以下の通り。
 nginxがfastcgiモジュールでunix socketにconnectするところで出力されている。
 
-`connect() to ... load-of-web.sock` と出力されていることからも認識と相違が無い。
-
 * ngx_http_fastcgi_handler => ngx_h ttp_client_request_body (https://github.com/nginx/nginx/blob/master/src/http/modules/ngx_http_fastcgi_module.c#L748)
 * ngx_http_client_request_body => post_handler(https://github.com/nginx/nginx/blob/master/src/http/ngx_http_request_body.c#L201)
 * post_handlerはngx_http_upstream_initの関数ポインタ(https://github.com/nginx/nginx/blob/master/src/http/ngx_http_upstream.c#L513)
@@ -341,10 +337,12 @@ nginxがfastcgiモジュールでunix socketにconnectするところで出力�
 * ngx_http_upstream_init_request => ngx_http_upstream_connect(https://github.com/nginx/nginx/blob/master/src/http/ngx_http_upstream.c#L729)
 * ngx_http_upstream_connect => ngx_event_connect_peer(https://github.com/nginx/nginx/blob/master/src/event/ngx_event_connect.c#L205)
 
-Resource temporary unavailableはEAGAINのエラーによるもの。(https://linuxjm.osdn.jp/html/LDP_man-pages/man3/errno.3.html)
-これはログから、11: Resource temporarily unavailableが出ていることからも明らかである。
+`connect() to ... load-of-web.sock` が文字列として渡されていることが分かる。
 
-以上からconnectのマニュアルを読んでみる。
+エラーログに出ているResource temporary unavailableはEAGAINが発生しているからである。(https://linuxjm.osdn.jp/html/LDP_man-pages/man3/errno.3.html)
+マニュアルと比較して明らかである。
+そして、コードとログを見るとconnect関数を呼び出したときにエラーが発生していることが分かる。
+ここでconnectのマニュアルを読んでみる。
 
 オンラインのconnectのマニュアルによるとUnixドメインソケットとルーティングキャッシュにエントリーが十分にないらしい。(https://linuxjm.osdn.jp/html/LDP_man-pages/man2/connect.2.html)
 ただし、ルーティングキャッシュがarpキャッシュのことだとするとunix socketとは関係が無いと考えられる。
