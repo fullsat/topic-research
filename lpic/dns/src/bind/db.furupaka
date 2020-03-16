@@ -1,0 +1,15 @@
+$TTL	60
+$ORIGIN furupaka.
+
+@	      IN	SOA	ns1 postmaster (
+     20200321   ; Serial
+			     60		; Refresh
+			     60		; Retry
+			     60		; Expire
+			      5 )	; Negative Cache TTL
+;
+
+      	IN	NS  ns1
+ns1    	IN	A   192.168.11.1
+winmain IN  A   192.168.11.5
+ubuntu  60 IN  A   192.168.11.15
